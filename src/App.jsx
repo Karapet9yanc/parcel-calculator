@@ -1,25 +1,28 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   Calculator,
   RotateCcw,
   Package,
   MapPin,
   AlertCircle,
+  Search,
 } from "lucide-react";
 import { motion } from "framer-motion";
-import CITIES from "./data/cities.json";
+import axios from "axios";
 
 const MOSCOW = {
   lat: 55.7558,
   lon: 37.6173,
 };
 
+const DADATA_TOKEN = import.meta.env.VITE_DADATA_TOKEN;
+
 const initialForm = {
   weight: "",
   length: "",
   width: "",
   height: "",
-  city: "",
+  citySearch: "",
   basePrice: "",
 };
 
@@ -41,8 +44,8 @@ function toRadians(value) {
 function getDistanceFromMoscow(city) {
   const earthRadiusKm = 6371;
 
-  const cityLat = Number(city.coords.lat);
-  const cityLon = Number(city.coords.lon);
+  const cityLat = Number(city.lat);
+  const cityLon = Number(city.lon);
 
   const dLat = toRadians(cityLat - MOSCOW.lat);
   const dLon = toRadians(cityLon - MOSCOW.lon);
@@ -62,17 +65,94 @@ function getDistanceFromMoscow(city) {
 function getMarkupByDistance(distance) {
   if (distance <= 500) return 20;
   if (distance <= 1500) return 25;
-  return 30;
+  if (distance <= 3000) return 30;
+  if (distance <= 6000) return 35;
+  return 40;
+}
+
+function getCityName(data) {
+  return (
+    data.city || data.settlement || data.area || data.region_with_type || ""
+  );
+}
+
+function getCityLabel(suggestion) {
+  const data = suggestion.data;
+
+  const city = getCityName(data);
+  const region = data.region_with_type || data.region || "";
+  const area = data.area_with_type || "";
+  const settlement = data.settlement_with_type || "";
+
+  const parts = [city, area, region].filter(Boolean);
+
+  if (settlement && settlement !== city) {
+    return `${settlement}, ${area || region}, Россия`;
+  }
+
+  return `${parts.join(", ")}, Россия`;
 }
 
 export default function ParcelPriceCalculator() {
   const [form, setForm] = useState(initialForm);
   const [submitted, setSubmitted] = useState(false);
+  const [isCityListOpen, setIsCityListOpen] = useState(false);
+  const [citySuggestions, setCitySuggestions] = useState([]);
+  const [selectedCity, setSelectedCity] = useState(null);
+  const [isLoadingCities, setIsLoadingCities] = useState(false);
 
-  const selectedCity = useMemo(
-    () => CITIES.find((city) => city.name === form.city),
-    [form.city],
-  );
+  useEffect(() => {
+    const query = form.citySearch.trim();
+
+    if (query.length < 2 || selectedCity) {
+      setCitySuggestions([]);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      try {
+        setIsLoadingCities(true);
+
+        const response = await axios.post(
+          "https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address",
+          {
+            query,
+            count: 10,
+            locations: [{ country_iso_code: "RU" }],
+            from_bound: { value: "city" },
+            to_bound: { value: "settlement" },
+          },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json",
+              Authorization: `Token ${DADATA_TOKEN}`,
+            },
+          },
+        );
+
+        const suggestions = response.data.suggestions
+          .filter((item) => item.data.geo_lat && item.data.geo_lon)
+          .map((item) => ({
+            label: getCityLabel(item),
+            name: getCityName(item.data),
+            region: item.data.region_with_type || item.data.region || "",
+            lat: item.data.geo_lat,
+            lon: item.data.geo_lon,
+          }));
+
+        setCitySuggestions(suggestions);
+        setIsCityListOpen(true);
+      } catch (error) {
+        console.error("Ошибка DaData:", error);
+        setCitySuggestions([]);
+      } finally {
+        setIsLoadingCities(false);
+      }
+    }, 350);
+
+    return () => clearTimeout(timer);
+  }, [form.citySearch, selectedCity]);
 
   const selectedDistance = useMemo(() => {
     if (!selectedCity) return 0;
@@ -87,7 +167,7 @@ export default function ParcelPriceCalculator() {
       ["length", "Введите длину"],
       ["width", "Введите ширину"],
       ["height", "Введите высоту"],
-      ["basePrice", "Введите базовую стоимость"],
+      ["basePrice", "Введите стоимость доставки по договору"],
     ];
 
     numericFields.forEach(([field, message]) => {
@@ -98,10 +178,10 @@ export default function ParcelPriceCalculator() {
         result[field] = "Значение должно быть больше 0";
     });
 
-    if (!form.city) result.city = "Выберите город доставки";
+    if (!selectedCity) result.city = "Выберите город из списка подсказок";
 
     return result;
-  }, [form]);
+  }, [form, selectedCity]);
 
   const isValid = Object.keys(errors).length === 0;
 
@@ -109,11 +189,8 @@ export default function ParcelPriceCalculator() {
     if (!selectedCity) return null;
 
     const basePrice = toNumber(form.basePrice);
-
     const markupPercent = getMarkupByDistance(selectedDistance);
-
     const markupAmount = basePrice * (markupPercent / 100);
-
     const totalPrice = basePrice + markupAmount;
 
     return {
@@ -133,6 +210,28 @@ export default function ParcelPriceCalculator() {
     }));
   };
 
+  const handleCitySearchChange = (event) => {
+    setForm((prev) => ({
+      ...prev,
+      citySearch: event.target.value,
+    }));
+
+    setSelectedCity(null);
+    setIsCityListOpen(true);
+  };
+
+  const handleSelectCity = (city) => {
+    setSelectedCity(city);
+
+    setForm((prev) => ({
+      ...prev,
+      citySearch: city.label,
+    }));
+
+    setCitySuggestions([]);
+    setIsCityListOpen(false);
+  };
+
   const handleCalculate = (event) => {
     event.preventDefault();
     setSubmitted(true);
@@ -141,6 +240,9 @@ export default function ParcelPriceCalculator() {
   const handleClear = () => {
     setForm(initialForm);
     setSubmitted(false);
+    setSelectedCity(null);
+    setCitySuggestions([]);
+    setIsCityListOpen(false);
   };
 
   const showResult = submitted && isValid && calculation;
@@ -153,12 +255,8 @@ export default function ParcelPriceCalculator() {
           animate={{ opacity: 1, y: 0 }}
           className="mb-6 rounded-3xl bg-white p-8 shadow-xl"
         >
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-6">
             <div>
-              <p className="text-sm font-medium uppercase tracking-wide text-violet-500">
-                
-              </p>
-
               <h1 className="mt-2 text-4xl font-bold">
                 Калькулятор стоимости доставки
               </h1>
@@ -220,31 +318,75 @@ export default function ParcelPriceCalculator() {
                 error={submitted && errors.height}
               />
 
-              <div>
+              <div className="relative md:col-span-2">
                 <label className="mb-2 block text-sm font-medium text-slate-700">
                   Город доставки
                 </label>
 
-                <select
-                  name="city"
-                  value={form.city}
-                  onChange={handleChange}
-                  className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-violet-500 focus:ring-4 focus:ring-violet-100"
-                >
-                  <option value="">Выберите город</option>
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
 
-                  {CITIES.map((city) => (
-                    <option key={city.name} value={city.name}>
-                      {city.name}
-                    </option>
-                  ))}
-                </select>
+                  <input
+                    type="text"
+                    name="citySearch"
+                    value={form.citySearch}
+                    onChange={handleCitySearchChange}
+                    onFocus={() => setIsCityListOpen(true)}
+                    placeholder="Введите город или населённый пункт"
+                    autoComplete="off"
+                    className="w-full rounded-2xl border border-slate-200 bg-white py-3 pl-11 pr-4 outline-none transition focus:border-violet-500 focus:ring-4 focus:ring-violet-100"
+                  />
+                </div>
+
+                {isCityListOpen && isLoadingCities && (
+                  <div className="absolute z-20 mt-2 w-full rounded-2xl border border-slate-200 bg-white p-4 text-slate-500 shadow-xl">
+                    Ищем варианты...
+                  </div>
+                )}
+
+                {isCityListOpen &&
+                  !isLoadingCities &&
+                  citySuggestions.length > 0 && (
+                    <div className="absolute z-20 mt-2 max-h-72 w-full overflow-y-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-xl">
+                      {citySuggestions.map((city) => (
+                        <button
+                          key={`${city.label}-${city.lat}-${city.lon}`}
+                          type="button"
+                          onClick={() => handleSelectCity(city)}
+                          className="w-full rounded-xl px-4 py-3 text-left transition hover:bg-violet-50"
+                        >
+                          <span className="block font-semibold text-slate-900">
+                            {city.name}
+                          </span>
+                          <span className="text-sm text-slate-500">
+                            {city.label}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                {isCityListOpen &&
+                  !isLoadingCities &&
+                  form.citySearch.trim().length >= 2 &&
+                  citySuggestions.length === 0 &&
+                  !selectedCity && (
+                    <div className="absolute z-20 mt-2 w-full rounded-2xl border border-slate-200 bg-white p-4 text-slate-500 shadow-xl">
+                      Город не найден. Проверьте название.
+                    </div>
+                  )}
+
+                {selectedCity && (
+                  <p className="mt-2 text-sm text-violet-600">
+                    Выбрано: {selectedCity.label}
+                  </p>
+                )}
 
                 {submitted && errors.city && <ErrorText text={errors.city} />}
               </div>
 
               <InputField
-                label="Базовая стоимость"
+                label="Стоимость доставки по договору"
                 name="basePrice"
                 value={form.basePrice}
                 onChange={handleChange}
@@ -295,6 +437,8 @@ export default function ParcelPriceCalculator() {
 
             {showResult && (
               <div className="space-y-4">
+                <ResultRow label="Город доставки" value={selectedCity.label} />
+
                 <ResultRow
                   label="Удалённость от Москвы"
                   value={`${calculation.distance} км`}
@@ -360,10 +504,10 @@ function ErrorText({ text }) {
 
 function ResultRow({ label, value }) {
   return (
-    <div className="flex items-center justify-between rounded-2xl bg-slate-50 p-4">
+    <div className="flex items-center justify-between gap-4 rounded-2xl bg-slate-50 p-4">
       <span className="text-slate-600">{label}</span>
 
-      <span className="font-semibold">{value}</span>
+      <span className="text-right font-semibold">{value}</span>
     </div>
   );
 }
